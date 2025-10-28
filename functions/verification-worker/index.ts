@@ -41,9 +41,33 @@ async function downloadList(url?: string): Promise<string[]> {
   if (!res.ok) return []
   const body = await res.text()
   return body
-    .split(/\r?\n/) 
+    .split(/\r?\n/)
     .map((l) => l.trim().toLowerCase())
     .filter((l) => l && l.includes('@'))
+}
+
+function buildListUrl(fileId: string, apiKey: string, results: string): string {
+  const base = `https://apps.emaillistverify.com/api/maillists/${encodeURIComponent(fileId)}`
+  const params = new URLSearchParams({
+    addEmail: 'false',
+    addFirstName: 'false',
+    addGender: 'false',
+    addIsFree: 'false',
+    addIsNoReply: 'false',
+    addIsRole: 'false',
+    addLastName: 'false',
+    addOriginal: 'true',
+    addResult: 'true',
+    addDuplicates: 'false',
+    addNoEmailRows: 'false',
+    addEsp: 'false',
+    addMxServer: 'false',
+    addInternalResult: 'false',
+    format: 'csv',
+    results,
+    secret: apiKey,
+  })
+  return `${base}?${params.toString()}`
 }
 
 async function processBatch() {
@@ -106,9 +130,17 @@ async function processBatch() {
         continue
       }
 
-      // Attempt to download result lists; assume link1 is valid emails, link2 invalid (best-effort)
-      const okEmails = await downloadList(info.link1)
-      const badEmails = await downloadList(info.link2)
+      // Download category lists explicitly via API (ok / bad / unknown)
+      const okUrl = buildListUrl(f.file_id, apiKey as string, 'ok')
+      const badCats = ['invalid_syntax','invalid_mx','email_disabled','dead_server','disposable','spamtrap']
+      const unkCats = ['unknown','ok_for_all','antispam_system','smtp_protocol']
+      const badUrl = buildListUrl(f.file_id, apiKey as string, badCats.join(','))
+      const unkUrl = buildListUrl(f.file_id, apiKey as string, unkCats.join(','))
+      const [okEmails, badEmails, unknownEmails] = await Promise.all([
+        downloadList(okUrl),
+        downloadList(badUrl),
+        downloadList(unkUrl),
+      ])
 
       console.log('verification-worker:complete', {
         fileId: f.file_id,
@@ -117,6 +149,7 @@ async function processBatch() {
         linesTotal: info.lines,
         ok: okEmails.length,
         bad: badEmails.length,
+        unknown: unknownEmails.length,
       })
 
       // Batch updates by email within campaign
@@ -146,7 +179,8 @@ async function processBatch() {
       try {
         const uploaded: string[] = Array.isArray((f as any).emails) ? ((f as any).emails as any[]).map((e:any)=> String(e).toLowerCase()) : []
         if (uploaded.length) {
-          const known = new Set<string>([...okEmails, ...badEmails].map((e)=> e.toLowerCase()))
+          // Consider already known unknowns too
+          const known = new Set<string>([...okEmails, ...badEmails, ...unknownEmails].map((e)=> e.toLowerCase()))
           const unknownEmails = uploaded.filter((e)=> !known.has(e))
           for (let i = 0; i < unknownEmails.length; i += chunk) {
             const slice = unknownEmails.slice(i, i + chunk)
@@ -158,7 +192,7 @@ async function processBatch() {
                 .in('email', slice)
             }
           }
-          console.log('verification-worker:unknown', { fileId: f.file_id, unknown: unknownEmails.length })
+          console.log('verification-worker:unknown_rest', { fileId: f.file_id, unknown: unknownEmails.length })
         }
       } catch (e) {
         console.error('verification-worker:unknown error', (e as any)?.message || String(e))
