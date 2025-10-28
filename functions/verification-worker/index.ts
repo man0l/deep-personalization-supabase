@@ -59,7 +59,7 @@ async function processBatch() {
   // Pull a small batch of unprocessed records
   const { data: rows, error } = await supabase
     .from('email_verification_files')
-    .select('id,campaign_id,file_id,lines,processed')
+    .select('id,campaign_id,file_id,lines,processed,emails')
     .eq('processed', false)
     .order('created_at', { ascending: true })
     .limit(20)
@@ -140,6 +140,28 @@ async function processBatch() {
             .eq('campaign_id', f.campaign_id)
             .in('email', slice)
         }
+      }
+
+      // Any remaining emails from the upload that are not in ok/bad -> mark as verified_unknown
+      try {
+        const uploaded: string[] = Array.isArray((f as any).emails) ? ((f as any).emails as any[]).map((e:any)=> String(e).toLowerCase()) : []
+        if (uploaded.length) {
+          const known = new Set<string>([...okEmails, ...badEmails].map((e)=> e.toLowerCase()))
+          const unknownEmails = uploaded.filter((e)=> !known.has(e))
+          for (let i = 0; i < unknownEmails.length; i += chunk) {
+            const slice = unknownEmails.slice(i, i + chunk)
+            if (slice.length) {
+              await supabase
+                .from('leads')
+                .update({ verification_status: 'verified_unknown', verification_checked_at: nowIso })
+                .eq('campaign_id', f.campaign_id)
+                .in('email', slice)
+            }
+          }
+          console.log('verification-worker:unknown', { fileId: f.file_id, unknown: unknownEmails.length })
+        }
+      } catch (e) {
+        console.error('verification-worker:unknown error', (e as any)?.message || String(e))
       }
 
       // Mark file as processed
