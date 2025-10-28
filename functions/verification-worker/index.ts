@@ -35,39 +35,25 @@ async function fetchFileInfo(apiKey: string, fileId: string): Promise<FileInfo |
   }
 }
 
-async function downloadList(url?: string): Promise<string[]> {
+async function downloadCsvPairs(url?: string): Promise<{ result: string; email: string }[]> {
   if (!url) return []
   const res = await fetch(url)
   if (!res.ok) return []
-  const body = await res.text()
-  return body
-    .split(/\r?\n/)
-    .map((l) => l.trim().toLowerCase())
-    .filter((l) => l && l.includes('@'))
-}
-
-function buildListUrl(fileId: string, apiKey: string, results: string): string {
-  const base = `https://apps.emaillistverify.com/api/maillists/${encodeURIComponent(fileId)}`
-  const params = new URLSearchParams({
-    addEmail: 'false',
-    addFirstName: 'false',
-    addGender: 'false',
-    addIsFree: 'false',
-    addIsNoReply: 'false',
-    addIsRole: 'false',
-    addLastName: 'false',
-    addOriginal: 'true',
-    addResult: 'true',
-    addDuplicates: 'false',
-    addNoEmailRows: 'false',
-    addEsp: 'false',
-    addMxServer: 'false',
-    addInternalResult: 'false',
-    format: 'csv',
-    results,
-    secret: apiKey,
-  })
-  return `${base}?${params.toString()}`
+  const text = (await res.text()) || ''
+  const lines = text.split(/\r?\n/)
+  const pairs: { result: string; email: string }[] = []
+  for (const line of lines) {
+    const l = line.trim()
+    if (!l) continue
+    if (l.toLowerCase().startsWith('elv result')) continue
+    const idx = l.indexOf(',')
+    if (idx === -1) continue
+    const result = l.slice(0, idx).trim().toLowerCase()
+    const email = l.slice(idx + 1).trim().toLowerCase()
+    if (!email.includes('@')) continue
+    pairs.push({ result, email })
+  }
+  return pairs
 }
 
 async function processBatch() {
@@ -130,17 +116,14 @@ async function processBatch() {
         continue
       }
 
-      // Download category lists explicitly via API (ok / bad / unknown)
-      const okUrl = buildListUrl(f.file_id, apiKey as string, 'ok')
-      const badCats = ['invalid_syntax','invalid_mx','email_disabled','dead_server','disposable','spamtrap']
-      const unkCats = ['unknown','ok_for_all','antispam_system','smtp_protocol']
-      const badUrl = buildListUrl(f.file_id, apiKey as string, badCats.join(','))
-      const unkUrl = buildListUrl(f.file_id, apiKey as string, unkCats.join(','))
-      const [okEmails, badEmails, unknownEmails] = await Promise.all([
-        downloadList(okUrl),
-        downloadList(badUrl),
-        downloadList(unkUrl),
-      ])
+      // Use provider links directly; parse CSV pairs (result,email)
+      const okPairs = await downloadCsvPairs(info.link1)
+      const allPairs = await downloadCsvPairs(info.link2)
+      const okEmails = Array.from(new Set(okPairs.filter(p=> p.result==='ok').map(p=> p.email)))
+      const badSet = new Set(['invalid_syntax','invalid_mx','email_disabled','dead_server','disposable','spamtrap'])
+      const unkSet = new Set(['unknown','ok_for_all','antispam_system','smtp_protocol'])
+      const badEmails = Array.from(new Set(allPairs.filter(p=> badSet.has(p.result)).map(p=> p.email)))
+      const unknownEmails = Array.from(new Set(allPairs.filter(p=> unkSet.has(p.result)).map(p=> p.email)))
 
       console.log('verification-worker:complete', {
         fileId: f.file_id,
@@ -170,6 +153,18 @@ async function processBatch() {
           await supabase
             .from('leads')
             .update({ verification_status: 'verified_bad', verification_checked_at: nowIso })
+            .eq('campaign_id', f.campaign_id)
+            .in('email', slice)
+        }
+      }
+
+      // Mark unknown category explicitly
+      for (let i = 0; i < unknownEmails.length; i += chunk) {
+        const slice = unknownEmails.slice(i, i + chunk)
+        if (slice.length) {
+          await supabase
+            .from('leads')
+            .update({ verification_status: 'verified_unknown', verification_checked_at: nowIso })
             .eq('campaign_id', f.campaign_id)
             .in('email', slice)
         }
