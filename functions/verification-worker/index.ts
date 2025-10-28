@@ -96,11 +96,28 @@ async function processBatch() {
 
       const statusLower = (info.status || '').toLowerCase()
       const complete = statusLower.includes('complete') || statusLower.includes('finish') || statusLower.includes('ready')
-      if (!complete) continue
+      if (!complete) {
+        console.log('verification-worker:progress', {
+          fileId: f.file_id,
+          status: info.status,
+          linesProcessed: info.lines_processed,
+          linesTotal: info.lines,
+        })
+        continue
+      }
 
       // Attempt to download result lists; assume link1 is valid emails, link2 invalid (best-effort)
       const okEmails = await downloadList(info.link1)
       const badEmails = await downloadList(info.link2)
+
+      console.log('verification-worker:complete', {
+        fileId: f.file_id,
+        status: info.status,
+        linesProcessed: info.lines_processed,
+        linesTotal: info.lines,
+        ok: okEmails.length,
+        bad: badEmails.length,
+      })
 
       // Batch updates by email within campaign
       const chunk = 500
