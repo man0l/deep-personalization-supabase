@@ -15,23 +15,40 @@ type FileInfo = {
 
 async function fetchFileInfo(apiKey: string, fileId: string): Promise<FileInfo | null> {
   const url = `https://apps.emaillistverify.com/api/getApiFileInfo?secret=${encodeURIComponent(apiKey)}&id=${encodeURIComponent(fileId)}`
-  const res = await fetch(url)
-  if (!res.ok) return null
-  const text = (await res.text()).trim()
-  // Expected pipe-separated values
-  const parts = text.split('|')
-  if (parts.length < 7) return null
-  const [fId, filename, unique, lines, linesProcessed, status, ts, link1, link2] = parts
-  return {
-    file_id: fId,
-    filename,
-    unique: Number(unique || '0'),
-    lines: Number(lines || '0'),
-    lines_processed: Number(linesProcessed || '0'),
-    status: status || '',
-    timestamp: ts || '',
-    link1,
-    link2,
+  try {
+    const res = await fetch(url)
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => '')
+      console.error('fetchFileInfo: HTTP error', { 
+        fileId, 
+        status: res.status, 
+        statusText: res.statusText,
+        response: errorText.substring(0, 200)
+      })
+      return null
+    }
+    const text = (await res.text()).trim()
+    // Expected pipe-separated values
+    const parts = text.split('|')
+    if (parts.length < 7) {
+      console.error('fetchFileInfo: invalid format', { fileId, partsCount: parts.length, preview: text.substring(0, 200) })
+      return null
+    }
+    const [fId, filename, unique, lines, linesProcessed, status, ts, link1, link2] = parts
+    return {
+      file_id: fId,
+      filename,
+      unique: Number(unique || '0'),
+      lines: Number(lines || '0'),
+      lines_processed: Number(linesProcessed || '0'),
+      status: status || '',
+      timestamp: ts || '',
+      link1,
+      link2,
+    }
+  } catch (e) {
+    console.error('fetchFileInfo: exception', { fileId, error: (e as any)?.message || String(e) })
+    return null
   }
 }
 
@@ -79,19 +96,27 @@ async function processBatch() {
     return new Response('error', { status: 500 })
   }
   const files = rows || []
-  if (files.length === 0) return new Response('no files')
+  if (files.length === 0) {
+    console.log('verification-worker: no files to process')
+    return new Response('no files')
+  }
+
+  console.log('verification-worker: processing', { fileCount: files.length, fileIds: files.map((f: any) => f.file_id) })
 
   for (const f of files) {
     try {
+      console.log('verification-worker: checking file', { fileId: f.file_id, id: f.id })
       const info = await fetchFileInfo(apiKey, f.file_id)
       const nowIso = new Date().toISOString()
       if (!info) {
+        console.log('verification-worker: file info null (likely 404 or error)', { fileId: f.file_id })
         await supabase
           .from('email_verification_files')
           .update({ checked_at: nowIso })
           .eq('id', f.id)
         continue
       }
+      console.log('verification-worker: file info retrieved', { fileId: f.file_id, status: info.status, linesProcessed: info.lines_processed })
       // Update file record with latest info
       await supabase
         .from('email_verification_files')
@@ -135,40 +160,55 @@ async function processBatch() {
         unknown: unknownEmails.length,
       })
 
-      // Batch updates by email within campaign
-      const chunk = 500
-      for (let i = 0; i < okEmails.length; i += chunk) {
-        const slice = okEmails.slice(i, i + chunk)
-        if (slice.length) {
-          await supabase
-            .from('leads')
-            .update({ verification_status: 'verified_ok', verification_checked_at: nowIso })
-            .eq('campaign_id', f.campaign_id)
-            .in('email', slice)
-        }
+      // Fetch all campaign leads once for case-insensitive email matching
+      // Build a map of lowercase email -> lead IDs (one email can map to multiple IDs if duplicates exist)
+      const { data: allLeads, error: fetchError } = await supabase
+        .from('leads')
+        .select('id,email')
+        .eq('campaign_id', f.campaign_id)
+      
+      if (fetchError) {
+        console.error('verification-worker:fetch error', fetchError.message)
+        throw fetchError
       }
-      for (let i = 0; i < badEmails.length; i += chunk) {
-        const slice = badEmails.slice(i, i + chunk)
-        if (slice.length) {
-          await supabase
-            .from('leads')
-            .update({ verification_status: 'verified_bad', verification_checked_at: nowIso })
-            .eq('campaign_id', f.campaign_id)
-            .in('email', slice)
+
+      // Build email -> IDs map (case-insensitive)
+      const emailToIds = new Map<string, string[]>()
+      for (const lead of (allLeads || [])) {
+        if (lead.email) {
+          const emailLower = String(lead.email).toLowerCase()
+          if (!emailToIds.has(emailLower)) {
+            emailToIds.set(emailLower, [])
+          }
+          emailToIds.get(emailLower)!.push(lead.id)
         }
       }
 
-      // Mark unknown category explicitly
-      for (let i = 0; i < unknownEmails.length; i += chunk) {
-        const slice = unknownEmails.slice(i, i + chunk)
-        if (slice.length) {
+      // Helper function to update leads by email (case-insensitive)
+      async function updateLeadsByEmail(emails: string[], status: 'verified_ok' | 'verified_bad' | 'verified_unknown') {
+        const allIds: string[] = []
+        for (const email of emails) {
+          const emailLower = email.toLowerCase()
+          const ids = emailToIds.get(emailLower) || []
+          allIds.push(...ids)
+        }
+        
+        if (allIds.length === 0) return
+
+        // Update by ID in chunks to avoid payload limits
+        const idChunk = 100
+        for (let i = 0; i < allIds.length; i += idChunk) {
+          const idSlice = allIds.slice(i, i + idChunk)
           await supabase
             .from('leads')
-            .update({ verification_status: 'verified_unknown', verification_checked_at: nowIso })
-            .eq('campaign_id', f.campaign_id)
-            .in('email', slice)
+            .update({ verification_status: status, verification_checked_at: nowIso })
+            .in('id', idSlice)
         }
       }
+
+      await updateLeadsByEmail(okEmails, 'verified_ok')
+      await updateLeadsByEmail(badEmails, 'verified_bad')
+      await updateLeadsByEmail(unknownEmails, 'verified_unknown')
 
       // Any remaining emails from the upload that are not in ok/bad -> mark as verified_unknown
       try {
@@ -176,18 +216,9 @@ async function processBatch() {
         if (uploaded.length) {
           // Consider already known unknowns too
           const known = new Set<string>([...okEmails, ...badEmails, ...unknownEmails].map((e)=> e.toLowerCase()))
-          const unknownEmails = uploaded.filter((e)=> !known.has(e))
-          for (let i = 0; i < unknownEmails.length; i += chunk) {
-            const slice = unknownEmails.slice(i, i + chunk)
-            if (slice.length) {
-              await supabase
-                .from('leads')
-                .update({ verification_status: 'verified_unknown', verification_checked_at: nowIso })
-                .eq('campaign_id', f.campaign_id)
-                .in('email', slice)
-            }
-          }
-          console.log('verification-worker:unknown_rest', { fileId: f.file_id, unknown: unknownEmails.length })
+          const remainingUnknownEmails = uploaded.filter((e)=> !known.has(e))
+          await updateLeadsByEmail(remainingUnknownEmails, 'verified_unknown')
+          console.log('verification-worker:unknown_rest', { fileId: f.file_id, unknown: remainingUnknownEmails.length })
         }
       } catch (e) {
         console.error('verification-worker:unknown error', (e as any)?.message || String(e))
@@ -207,5 +238,6 @@ async function processBatch() {
 }
 
 Deno.serve((_req) => processBatch())
+
 
 
