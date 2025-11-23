@@ -3,48 +3,54 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js'
 
 type FileInfo = {
   file_id: string
-  filename: string
-  unique: number
-  lines: number
-  lines_processed: number
   status: string
-  timestamp: string
-  link1?: string
-  link2?: string
+  lines?: number
+  lines_processed?: number
 }
 
 async function fetchFileInfo(apiKey: string, fileId: string): Promise<FileInfo | null> {
-  const url = `https://apps.emaillistverify.com/api/getApiFileInfo?secret=${encodeURIComponent(apiKey)}&id=${encodeURIComponent(fileId)}`
+  // Ensure fileId is a string and trim it
+  const cleanFileId = String(fileId).trim()
+  if (!cleanFileId) {
+    console.error('fetchFileInfo: empty fileId')
+    return null
+  }
+  
+  // Try file_id parameter first (as per documentation)
+  let url = `https://bulkapi.millionverifier.com/bulkapi/v2/fileinfo?key=${encodeURIComponent(apiKey)}&file_id=${encodeURIComponent(cleanFileId)}`
   try {
-    const res = await fetch(url)
+    let res = await fetch(url)
+    
+    // If 404, try with 'id' parameter instead (some APIs use different param names)
+    if (res.status === 404) {
+      console.log('fetchFileInfo: 404 with file_id parameter, trying with id parameter', { fileId: cleanFileId })
+      url = `https://bulkapi.millionverifier.com/bulkapi/v2/fileinfo?key=${encodeURIComponent(apiKey)}&id=${encodeURIComponent(cleanFileId)}`
+      res = await fetch(url)
+    }
+    
     if (!res.ok) {
       const errorText = await res.text().catch(() => '')
       console.error('fetchFileInfo: HTTP error', { 
-        fileId, 
+        fileId: cleanFileId,
+        fileIdType: typeof cleanFileId,
         status: res.status, 
         statusText: res.statusText,
+        url: url.replace(apiKey, '***'), // Log URL without exposing full key
         response: errorText.substring(0, 200)
       })
       return null
     }
-    const text = (await res.text()).trim()
-    // Expected pipe-separated values
-    const parts = text.split('|')
-    if (parts.length < 7) {
-      console.error('fetchFileInfo: invalid format', { fileId, partsCount: parts.length, preview: text.substring(0, 200) })
+    const json = await res.json().catch(() => null)
+    if (!json || typeof json !== 'object') {
+      console.error('fetchFileInfo: invalid JSON', { fileId, preview: (await res.text().catch(() => '')).substring(0, 200) })
       return null
     }
-    const [fId, filename, unique, lines, linesProcessed, status, ts, link1, link2] = parts
+    // MillionVerifier returns JSON with status field: in_progress, finished, canceled
     return {
-      file_id: fId,
-      filename,
-      unique: Number(unique || '0'),
-      lines: Number(lines || '0'),
-      lines_processed: Number(linesProcessed || '0'),
-      status: status || '',
-      timestamp: ts || '',
-      link1,
-      link2,
+      file_id: fileId,
+      status: json.status || '',
+      lines: json.lines ? Number(json.lines) : undefined,
+      lines_processed: json.lines_processed ? Number(json.lines_processed) : undefined,
     }
   } catch (e) {
     console.error('fetchFileInfo: exception', { fileId, error: (e as any)?.message || String(e) })
@@ -52,33 +58,52 @@ async function fetchFileInfo(apiKey: string, fileId: string): Promise<FileInfo |
   }
 }
 
-async function downloadCsvPairs(url?: string): Promise<{ result: string; email: string }[]> {
-  if (!url) return []
-  const res = await fetch(url)
-  if (!res.ok) return []
-  const text = (await res.text()) || ''
-  const lines = text.split(/\r?\n/)
-  const pairs: { result: string; email: string }[] = []
-  for (const line of lines) {
-    const l = line.trim()
-    if (!l) continue
-    if (l.toLowerCase().startsWith('elv result')) continue
-    const idx = l.indexOf(',')
-    if (idx === -1) continue
-    const result = l.slice(0, idx).trim().toLowerCase()
-    const email = l.slice(idx + 1).trim().toLowerCase()
-    if (!email.includes('@')) continue
-    pairs.push({ result, email })
+async function downloadCsvPairs(apiKey: string, fileId: string, filter: string): Promise<{ result: string; email: string }[]> {
+  const url = `https://bulkapi.millionverifier.com/bulkapi/v2/download?key=${encodeURIComponent(apiKey)}&file_id=${encodeURIComponent(fileId)}&filter=${encodeURIComponent(filter)}`
+  try {
+    const res = await fetch(url)
+    if (!res.ok) return []
+    const text = (await res.text()) || ''
+    const lines = text.split(/\r?\n/)
+    const pairs: { result: string; email: string }[] = []
+    for (const line of lines) {
+      const l = line.trim()
+      if (!l) continue
+      // MillionVerifier CSV format when using filters: may be just email, or email,result
+      const parts = l.split(',')
+      let email = ''
+      let result = filter // Default result is the filter name
+      
+      if (parts.length === 1) {
+        // Just email, no result column
+        email = parts[0].trim().toLowerCase()
+      } else if (parts.length >= 2) {
+        // Try both orders: email,result and result,email
+        email = parts[0].trim().toLowerCase()
+        result = parts[1].trim().toLowerCase()
+        // If first part doesn't look like an email, try reverse
+        if (!email.includes('@')) {
+          email = parts[1].trim().toLowerCase()
+          result = parts[0].trim().toLowerCase()
+        }
+      }
+      
+      if (!email.includes('@')) continue
+      pairs.push({ result, email })
+    }
+    return pairs
+  } catch (e) {
+    console.error('downloadCsvPairs: exception', { fileId, filter, error: (e as any)?.message || String(e) })
+    return []
   }
-  return pairs
 }
 
 async function processBatch() {
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!
   const serviceKey = Deno.env.get('SERVICE_ROLE_KEY')!
-  const apiKey = Deno.env.get('EMAIL_LIST_VERIFY_KEY') || Deno.env.get('ELV_API_KEY')
+  const apiKey = Deno.env.get('EMAIL_MILLIONVERIFIER_KEY')
   if (!apiKey) {
-    console.error('Missing EMAIL_LIST_VERIFY_KEY')
+    console.error('Missing EMAIL_MILLIONVERIFIER_KEY')
     return new Response('missing key', { status: 500 })
   }
   const supabase = createClient(supabaseUrl, serviceKey)
@@ -105,11 +130,17 @@ async function processBatch() {
 
   for (const f of files) {
     try {
-      console.log('verification-worker: checking file', { fileId: f.file_id, id: f.id })
+      console.log('verification-worker: checking file', { fileId: f.file_id, id: f.id, filename: (f as any).filename })
       const info = await fetchFileInfo(apiKey, f.file_id)
       const nowIso = new Date().toISOString()
       if (!info) {
-        console.log('verification-worker: file info null (likely 404 or error)', { fileId: f.file_id })
+        console.log('verification-worker: file info null (likely 404 or error)', { 
+          fileId: f.file_id,
+          fileIdType: typeof f.file_id,
+          fileIdLength: String(f.file_id).length
+        })
+        // Don't mark as checked if it's a 404 - might be a temporary issue or wrong file_id format
+        // Only update checked_at if we've tried multiple times
         await supabase
           .from('email_verification_files')
           .update({ checked_at: nowIso })
@@ -123,14 +154,13 @@ async function processBatch() {
         .update({
           status: info.status,
           lines_processed: info.lines_processed,
-          link1: info.link1 || null,
-          link2: info.link2 || null,
           checked_at: nowIso,
         })
         .eq('id', f.id)
 
       const statusLower = (info.status || '').toLowerCase()
-      const complete = statusLower.includes('complete') || statusLower.includes('finish') || statusLower.includes('ready')
+      // MillionVerifier status: in_progress, finished, canceled
+      const complete = statusLower === 'finished'
       if (!complete) {
         console.log('verification-worker:progress', {
           fileId: f.file_id,
@@ -141,14 +171,26 @@ async function processBatch() {
         continue
       }
 
-      // Use provider links directly; parse CSV pairs (result,email)
-      const okPairs = await downloadCsvPairs(info.link1)
-      const allPairs = await downloadCsvPairs(info.link2)
-      const okEmails = Array.from(new Set(okPairs.filter(p=> p.result==='ok').map(p=> p.email)))
-      const badSet = new Set(['invalid_syntax','invalid_mx','email_disabled','dead_server','disposable','spamtrap'])
-      const unkSet = new Set(['unknown','ok_for_all','antispam_system','smtp_protocol'])
-      const badEmails = Array.from(new Set(allPairs.filter(p=> badSet.has(p.result)).map(p=> p.email)))
-      const unknownEmails = Array.from(new Set(allPairs.filter(p=> unkSet.has(p.result)).map(p=> p.email)))
+      // Download results using MillionVerifier filter parameters
+      // filter options: ok, ok_and_catch_all, unknown, invalid, all
+      const okPairs = await downloadCsvPairs(apiKey, f.file_id, 'ok')
+      const okAndCatchAllPairs = await downloadCsvPairs(apiKey, f.file_id, 'ok_and_catch_all')
+      const invalidPairs = await downloadCsvPairs(apiKey, f.file_id, 'invalid')
+      const unknownPairs = await downloadCsvPairs(apiKey, f.file_id, 'unknown')
+      
+      // Combine all results
+      const allPairs = [...okPairs, ...okAndCatchAllPairs, ...invalidPairs, ...unknownPairs]
+      
+      // Map MillionVerifier results to our statuses
+      // ok and ok_and_catch_all -> verified_ok
+      const okEmails = Array.from(new Set([
+        ...okPairs.map(p => p.email),
+        ...okAndCatchAllPairs.map(p => p.email)
+      ]))
+      // invalid -> verified_bad
+      const badEmails = Array.from(new Set(invalidPairs.map(p => p.email)))
+      // unknown -> verified_unknown
+      const unknownEmails = Array.from(new Set(unknownPairs.map(p => p.email)))
 
       console.log('verification-worker:complete', {
         fileId: f.file_id,
