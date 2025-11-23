@@ -182,13 +182,14 @@ async function processBatch() {
       const allPairs = [...okPairs, ...okAndCatchAllPairs, ...invalidPairs, ...unknownPairs]
       
       // Map MillionVerifier results to our statuses
-      // ok and ok_and_catch_all -> verified_ok
-      const okEmails = Array.from(new Set([
-        ...okPairs.map(p => p.email),
-        ...okAndCatchAllPairs.map(p => p.email)
+      // Only ok (not catch_all) -> verified_ok
+      // Risky emails (ok_and_catch_all) -> verified_bad (treat as bad)
+      const okEmails = Array.from(new Set(okPairs.map(p => p.email)))
+      // invalid and risky (catch_all) -> verified_bad
+      const badEmails = Array.from(new Set([
+        ...invalidPairs.map(p => p.email),
+        ...okAndCatchAllPairs.map(p => p.email) // Risky emails count as bad
       ]))
-      // invalid -> verified_bad
-      const badEmails = Array.from(new Set(invalidPairs.map(p => p.email)))
       // unknown -> verified_unknown
       const unknownEmails = Array.from(new Set(unknownPairs.map(p => p.email)))
 
