@@ -261,6 +261,18 @@ async function processBatch() {
       // unknown -> verified_unknown
       const unknownEmails = Array.from(new Set(unknownPairs.map(p => p.email)))
       
+      // Get file emails for comparison
+      const fileEmailsForComparison: string[] = Array.isArray((f as any).emails) 
+        ? ((f as any).emails as any[]).map((e:any)=> String(e).toLowerCase().trim())
+        : []
+      const fileEmailsSetForComparison = new Set(fileEmailsForComparison)
+      
+      // Check which downloaded emails are in the file
+      const okInFile = okEmails.filter(e => fileEmailsSetForComparison.has(e.toLowerCase().trim()))
+      const badInFile = badEmails.filter(e => fileEmailsSetForComparison.has(e.toLowerCase().trim()))
+      const okNotInFile = okEmails.filter(e => !fileEmailsSetForComparison.has(e.toLowerCase().trim()))
+      const badNotInFile = badEmails.filter(e => !fileEmailsSetForComparison.has(e.toLowerCase().trim()))
+      
       console.log('verification-worker: mapped emails', {
         fileId: f.file_id,
         okCount: okEmails.length,
@@ -270,6 +282,13 @@ async function processBatch() {
         badEmailsSample: Array.from(badEmails).slice(0, 5),
         okAndCatchAllCount: okAndCatchAllPairs.length,
         okAndCatchAllAfterFilter: okAndCatchAllPairs.filter(p => !okEmailsSet.has(p.email)).length,
+        fileEmailsCount: fileEmailsForComparison.length,
+        okInFile: okInFile.length,
+        badInFile: badInFile.length,
+        okNotInFile: okNotInFile.length,
+        badNotInFile: badNotInFile.length,
+        okNotInFileSample: okNotInFile.slice(0, 3),
+        badNotInFileSample: badNotInFile.slice(0, 3),
       })
 
       console.log('verification-worker:complete', {
@@ -282,12 +301,9 @@ async function processBatch() {
         unknown: unknownEmails.length,
       })
 
-      // Get the list of emails from the file to filter leads
-      const fileEmails: string[] = Array.isArray((f as any).emails) 
-        ? ((f as any).emails as any[]).map((e:any)=> String(e).toLowerCase().trim())
-        : []
-      
-      // Fetch campaign leads for case-insensitive email matching
+      // Fetch ALL campaign leads for case-insensitive email matching
+      // We use all leads (not filtered by file.emails) to ensure we can match
+      // any email returned by MillionVerifier, even if there are formatting differences
       const { data: allLeads, error: fetchError } = await supabase
         .from('leads')
         .select('id,email')
@@ -298,26 +314,9 @@ async function processBatch() {
         throw fetchError
       }
       
-      // Filter to only leads whose emails (lowercase) are in the file (if file emails available)
-      let leadsToProcess = (allLeads || [])
-      if (fileEmails.length > 0) {
-        const fileEmailsSet = new Set(fileEmails)
-        leadsToProcess = leadsToProcess.filter((lead: any) => {
-          if (!lead.email) return false
-          return fileEmailsSet.has(String(lead.email).toLowerCase().trim())
-        })
-        
-        console.log('verification-worker: filtered leads', {
-          fileId: f.file_id,
-          fileEmailsCount: fileEmails.length,
-          allLeadsCount: (allLeads || []).length,
-          matchingLeadsCount: leadsToProcess.length,
-        })
-      }
-      
-      // Build email -> IDs map (case-insensitive)
+      // Build email -> IDs map (case-insensitive) from ALL campaign leads
       const emailToIds = new Map<string, string[]>()
-      for (const lead of leadsToProcess) {
+      for (const lead of (allLeads || [])) {
         if (lead.email) {
           const emailLower = String(lead.email).toLowerCase().trim()
           if (!emailToIds.has(emailLower)) {
