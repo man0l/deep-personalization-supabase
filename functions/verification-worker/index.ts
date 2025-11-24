@@ -309,23 +309,67 @@ async function processBatch() {
       // Helper function to update leads by email (case-insensitive)
       async function updateLeadsByEmail(emails: string[], status: 'verified_ok' | 'verified_bad' | 'verified_unknown') {
         const allIds: string[] = []
+        const notFound: string[] = []
         for (const email of emails) {
-          const emailLower = email.toLowerCase()
+          const emailLower = email.toLowerCase().trim()
           const ids = emailToIds.get(emailLower) || []
-          allIds.push(...ids)
+          if (ids.length === 0) {
+            notFound.push(emailLower)
+          } else {
+            allIds.push(...ids)
+          }
         }
         
-        if (allIds.length === 0) return
+        if (notFound.length > 0) {
+          console.log('verification-worker: emails not found in map', {
+            fileId: f.file_id,
+            status,
+            notFoundCount: notFound.length,
+            notFoundSample: notFound.slice(0, 5),
+            totalEmails: emails.length,
+            foundIds: allIds.length,
+          })
+        }
+        
+        if (allIds.length === 0) {
+          console.log('verification-worker: no IDs to update', {
+            fileId: f.file_id,
+            status,
+            emailCount: emails.length,
+            emailToIdsSize: emailToIds.size,
+          })
+          return
+        }
 
         // Update by ID in chunks to avoid payload limits
         const idChunk = 100
+        let updatedCount = 0
         for (let i = 0; i < allIds.length; i += idChunk) {
           const idSlice = allIds.slice(i, i + idChunk)
-          await supabase
+          const { error: updateError } = await supabase
             .from('leads')
             .update({ verification_status: status, verification_checked_at: nowIso })
             .in('id', idSlice)
+          
+          if (updateError) {
+            console.error('verification-worker: update error', {
+              fileId: f.file_id,
+              status,
+              error: updateError.message,
+              chunkIndex: i,
+            })
+          } else {
+            updatedCount += idSlice.length
+          }
         }
+        
+        console.log('verification-worker: updateLeadsByEmail result', {
+          fileId: f.file_id,
+          status,
+          emailCount: emails.length,
+          idCount: allIds.length,
+          updatedCount,
+        })
       }
 
       console.log('verification-worker: updating leads', {
