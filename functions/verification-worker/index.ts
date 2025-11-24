@@ -23,7 +23,6 @@ async function fetchFileInfo(apiKey: string, fileId: string): Promise<FileInfo |
     
     // If 404, try with 'id' parameter instead (some APIs use different param names)
     if (res.status === 404) {
-      console.log('fetchFileInfo: 404 with file_id parameter, trying with id parameter', { fileId: cleanFileId })
       url = `https://bulkapi.millionverifier.com/bulkapi/v2/fileinfo?key=${encodeURIComponent(apiKey)}&id=${encodeURIComponent(cleanFileId)}`
       res = await fetch(url)
     }
@@ -70,7 +69,6 @@ async function downloadAllResults(apiKey: string, fileId: string): Promise<{ ema
     }
     const text = (await res.text()) || ''
     if (!text.trim()) {
-      console.log('downloadAllResults: empty response', { fileId })
       return []
     }
     
@@ -141,7 +139,6 @@ async function downloadAllResults(apiKey: string, fileId: string): Promise<{ ema
       }
     }
     
-    console.log('downloadAllResults: downloaded', { fileId, count: results.length })
     return results
   } catch (e) {
     console.error('downloadAllResults: exception', { fileId, error: (e as any)?.message || String(e) })
@@ -173,28 +170,21 @@ async function processBatch() {
   }
   const files = rows || []
   if (files.length === 0) {
-    console.log('verification-worker: no files to process')
     return new Response('no files')
   }
 
-  console.log('verification-worker: processing', { fileCount: files.length })
-
   for (const f of files) {
     try {
-      console.log('verification-worker: checking file', { fileId: f.file_id })
       const info = await fetchFileInfo(apiKey, f.file_id)
       const nowIso = new Date().toISOString()
       if (!info) {
-        console.log('verification-worker: file info null', { fileId: f.file_id })
         // Don't mark as checked if it's a 404 - might be a temporary issue or wrong file_id format
-        // Only update checked_at if we've tried multiple times
         await supabase
           .from('email_verification_files')
           .update({ checked_at: nowIso })
           .eq('id', f.id)
         continue
       }
-      console.log('verification-worker: file info', { fileId: f.file_id, status: info.status, linesProcessed: info.lines_processed })
       // Update file record with latest info
       await supabase
         .from('email_verification_files')
@@ -221,21 +211,8 @@ async function processBatch() {
       const isComplete = complete || allProcessed
       
       if (!isComplete) {
-        console.log('verification-worker:progress', {
-          fileId: f.file_id,
-          status: info.status,
-          linesProcessed: info.lines_processed,
-          linesTotal: info.lines,
-        })
         continue
       }
-      
-      console.log('verification-worker: file complete', {
-        fileId: f.file_id,
-        status: info.status,
-        linesProcessed: info.lines_processed,
-        linesTotal: info.lines,
-      })
 
       // Download all results from MillionVerifier (using filter=all to get complete CSV with quality/result columns)
       const allResults = await downloadAllResults(apiKey, f.file_id)
@@ -269,20 +246,6 @@ async function processBatch() {
       const okEmailsSet = new Set(okEmails)
       const badEmailsSet = new Set(badEmails)
       const unknownEmailsSet = new Set(unknownEmails)
-      
-      console.log('verification-worker: mapped emails', {
-        fileId: f.file_id,
-        okCount: okEmailsSet.size,
-        badCount: badEmailsSet.size,
-        unknownCount: unknownEmailsSet.size,
-      })
-
-      console.log('verification-worker: complete', {
-        fileId: f.file_id,
-        ok: okEmailsSet.size,
-        bad: badEmailsSet.size,
-        unknown: unknownEmailsSet.size,
-      })
 
       // Fetch ALL campaign leads for case-insensitive email matching
       // We use all leads (not filtered by file.emails) to ensure we can match
@@ -309,11 +272,6 @@ async function processBatch() {
         }
       }
       
-      console.log('verification-worker: emailToIds map built', {
-        fileId: f.file_id,
-        mapSize: emailToIds.size,
-      })
-      
       // Helper function to update leads by email (case-insensitive)
       async function updateLeadsByEmail(emails: string[], status: 'verified_ok' | 'verified_bad' | 'verified_unknown') {
         const allIds: string[] = []
@@ -328,23 +286,7 @@ async function processBatch() {
           }
         }
         
-        if (notFound.length > 0) {
-          console.log('verification-worker: emails not found in map', {
-            fileId: f.file_id,
-            status,
-            notFoundCount: notFound.length,
-            totalEmails: emails.length,
-            foundIds: allIds.length,
-          })
-        }
-        
         if (allIds.length === 0) {
-          console.log('verification-worker: no IDs to update', {
-            fileId: f.file_id,
-            status,
-            emailCount: emails.length,
-            emailToIdsSize: emailToIds.size,
-          })
           return
         }
 
@@ -369,33 +311,11 @@ async function processBatch() {
             updatedCount += idSlice.length
           }
         }
-        
-        console.log('verification-worker: updateLeadsByEmail result', {
-          fileId: f.file_id,
-          status,
-          emailCount: emails.length,
-          idCount: allIds.length,
-          updatedCount,
-        })
       }
 
-      console.log('verification-worker: updating leads', {
-        fileId: f.file_id,
-        okCount: okEmailsSet.size,
-        badCount: badEmailsSet.size,
-        unknownCount: unknownEmailsSet.size,
-      })
-      
       await updateLeadsByEmail(Array.from(okEmailsSet), 'verified_ok')
       await updateLeadsByEmail(Array.from(badEmailsSet), 'verified_bad')
       await updateLeadsByEmail(Array.from(unknownEmailsSet), 'verified_unknown')
-      
-      console.log('verification-worker: leads updated', {
-        fileId: f.file_id,
-        okUpdated: okEmailsSet.size,
-        badUpdated: badEmailsSet.size,
-        unknownUpdated: unknownEmailsSet.size,
-      })
 
       // Any remaining emails from the upload that are not in any result -> mark as verified_unknown
       try {
@@ -406,12 +326,19 @@ async function processBatch() {
           const remainingUnknownEmails = uploaded.filter((e)=> !known.has(e))
           if (remainingUnknownEmails.length > 0) {
             await updateLeadsByEmail(remainingUnknownEmails, 'verified_unknown')
-            console.log('verification-worker:unknown_rest', { fileId: f.file_id, unknown: remainingUnknownEmails.length })
           }
         }
       } catch (e) {
         console.error('verification-worker:unknown error', (e as any)?.message || String(e))
       }
+
+      // Log successful processing
+      console.log('verification-worker: processed', {
+        fileId: f.file_id,
+        ok: okEmailsSet.size,
+        bad: badEmailsSet.size,
+        unknown: unknownEmailsSet.size,
+      })
 
       // Mark file as processed
       await supabase
