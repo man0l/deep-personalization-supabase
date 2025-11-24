@@ -250,19 +250,40 @@ async function processBatch() {
       // Fetch ALL campaign leads for case-insensitive email matching
       // We use all leads (not filtered by file.emails) to ensure we can match
       // any email returned by MillionVerifier, even if there are formatting differences
-      const { data: allLeads, error: fetchError } = await supabase
-        .from('leads')
-        .select('id,email')
-        .eq('campaign_id', f.campaign_id)
+      // Fetch in chunks to avoid Supabase's default limit (1000 rows)
+      const chunkSize = 1000
+      let offset = 0
+      const allLeads: any[] = []
       
-      if (fetchError) {
-        console.error('verification-worker:fetch error', fetchError.message)
-        throw fetchError
+      while (true) {
+        const to = Math.max(offset, offset + chunkSize - 1)
+        const { data: chunk, error: fetchError } = await supabase
+          .from('leads')
+          .select('id,email')
+          .eq('campaign_id', f.campaign_id)
+          .range(offset, to)
+        
+        if (fetchError) {
+          console.error('verification-worker:fetch error', fetchError.message)
+          throw fetchError
+        }
+        
+        if (!chunk || chunk.length === 0) {
+          break
+        }
+        
+        allLeads.push(...chunk)
+        
+        if (chunk.length < chunkSize) {
+          break
+        }
+        
+        offset += chunkSize
       }
       
       // Build email -> IDs map (case-insensitive) from ALL campaign leads
       const emailToIds = new Map<string, string[]>()
-      for (const lead of (allLeads || [])) {
+      for (const lead of allLeads) {
         if (lead.email) {
           const emailLower = String(lead.email).toLowerCase().trim()
           if (!emailToIds.has(emailLower)) {
