@@ -282,8 +282,12 @@ async function processBatch() {
         unknown: unknownEmails.length,
       })
 
-      // Fetch all campaign leads once for case-insensitive email matching
-      // Build a map of lowercase email -> lead IDs (one email can map to multiple IDs if duplicates exist)
+      // Get the list of emails from the file to filter leads
+      const fileEmails: string[] = Array.isArray((f as any).emails) 
+        ? ((f as any).emails as any[]).map((e:any)=> String(e).toLowerCase().trim())
+        : []
+      
+      // Fetch campaign leads for case-insensitive email matching
       const { data: allLeads, error: fetchError } = await supabase
         .from('leads')
         .select('id,email')
@@ -293,17 +297,106 @@ async function processBatch() {
         console.error('verification-worker:fetch error', fetchError.message)
         throw fetchError
       }
-
+      
+      // Filter to only leads whose emails (lowercase) are in the file (if file emails available)
+      let leadsToProcess = (allLeads || [])
+      if (fileEmails.length > 0) {
+        const fileEmailsSet = new Set(fileEmails)
+        leadsToProcess = leadsToProcess.filter((lead: any) => {
+          if (!lead.email) return false
+          return fileEmailsSet.has(String(lead.email).toLowerCase().trim())
+        })
+        
+        console.log('verification-worker: filtered leads', {
+          fileId: f.file_id,
+          fileEmailsCount: fileEmails.length,
+          allLeadsCount: (allLeads || []).length,
+          matchingLeadsCount: leadsToProcess.length,
+        })
+      }
+      
       // Build email -> IDs map (case-insensitive)
       const emailToIds = new Map<string, string[]>()
-      for (const lead of (allLeads || [])) {
+      for (const lead of leadsToProcess) {
         if (lead.email) {
-          const emailLower = String(lead.email).toLowerCase()
+          const emailLower = String(lead.email).toLowerCase().trim()
           if (!emailToIds.has(emailLower)) {
             emailToIds.set(emailLower, [])
           }
           emailToIds.get(emailLower)!.push(lead.id)
         }
+      }
+      
+      console.log('verification-worker: emailToIds map built', {
+        fileId: f.file_id,
+        mapSize: emailToIds.size,
+        sampleKeys: Array.from(emailToIds.keys()).slice(0, 5),
+      })
+      
+      // Helper function to update leads by email (case-insensitive)
+      async function updateLeadsByEmail(emails: string[], status: 'verified_ok' | 'verified_bad' | 'verified_unknown') {
+        const allIds: string[] = []
+        const notFound: string[] = []
+        for (const email of emails) {
+          const emailLower = email.toLowerCase().trim()
+          const ids = emailToIds.get(emailLower) || []
+          if (ids.length === 0) {
+            notFound.push(emailLower)
+          } else {
+            allIds.push(...ids)
+          }
+        }
+        
+        if (notFound.length > 0) {
+          console.log('verification-worker: emails not found in map', {
+            fileId: f.file_id,
+            status,
+            notFoundCount: notFound.length,
+            notFoundSample: notFound.slice(0, 5),
+            totalEmails: emails.length,
+            foundIds: allIds.length,
+          })
+        }
+        
+        if (allIds.length === 0) {
+          console.log('verification-worker: no IDs to update', {
+            fileId: f.file_id,
+            status,
+            emailCount: emails.length,
+            emailToIdsSize: emailToIds.size,
+          })
+          return
+        }
+
+        // Update by ID in chunks to avoid payload limits
+        const idChunk = 100
+        let updatedCount = 0
+        for (let i = 0; i < allIds.length; i += idChunk) {
+          const idSlice = allIds.slice(i, i + idChunk)
+          const { error: updateError } = await supabase
+            .from('leads')
+            .update({ verification_status: status, verification_checked_at: nowIso })
+            .in('id', idSlice)
+          
+          if (updateError) {
+            console.error('verification-worker: update error', {
+              fileId: f.file_id,
+              status,
+              error: updateError.message,
+              chunkIndex: i,
+            })
+          } else {
+            updatedCount += idSlice.length
+          }
+        }
+        
+        console.log('verification-worker: updateLeadsByEmail result', {
+          fileId: f.file_id,
+          status,
+          emailCount: emails.length,
+          idCount: allIds.length,
+          updatedCount,
+        })
       }
 
       // Helper function to update leads by email (case-insensitive)
