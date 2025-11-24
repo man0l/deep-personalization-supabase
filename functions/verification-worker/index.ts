@@ -62,35 +62,63 @@ async function downloadCsvPairs(apiKey: string, fileId: string, filter: string):
   const url = `https://bulkapi.millionverifier.com/bulkapi/v2/download?key=${encodeURIComponent(apiKey)}&file_id=${encodeURIComponent(fileId)}&filter=${encodeURIComponent(filter)}`
   try {
     const res = await fetch(url)
-    if (!res.ok) return []
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => '')
+      console.error('downloadCsvPairs: HTTP error', { 
+        fileId, 
+        filter, 
+        status: res.status, 
+        statusText: res.statusText,
+        response: errorText.substring(0, 200)
+      })
+      return []
+    }
     const text = (await res.text()) || ''
+    if (!text.trim()) {
+      console.log('downloadCsvPairs: empty response', { fileId, filter })
+      return []
+    }
+    
     const lines = text.split(/\r?\n/)
     const pairs: { result: string; email: string }[] = []
+    let headerSkipped = false
+    
     for (const line of lines) {
       const l = line.trim()
       if (!l) continue
-      // MillionVerifier CSV format when using filters: may be just email, or email,result
-      const parts = l.split(',')
+      
+      // Skip header row if present
+      if (!headerSkipped && (l.toLowerCase().includes('email') || l.toLowerCase().includes('result'))) {
+        headerSkipped = true
+        continue
+      }
+      headerSkipped = true
+      
+      // MillionVerifier CSV format: typically just email per line when using filters
+      // But could also be email,result or result,email
+      const parts = l.split(',').map(p => p.trim())
       let email = ''
       let result = filter // Default result is the filter name
       
       if (parts.length === 1) {
         // Just email, no result column
-        email = parts[0].trim().toLowerCase()
+        email = parts[0].toLowerCase()
       } else if (parts.length >= 2) {
         // Try both orders: email,result and result,email
-        email = parts[0].trim().toLowerCase()
-        result = parts[1].trim().toLowerCase()
+        email = parts[0].toLowerCase()
+        result = parts[1].toLowerCase()
         // If first part doesn't look like an email, try reverse
         if (!email.includes('@')) {
-          email = parts[1].trim().toLowerCase()
-          result = parts[0].trim().toLowerCase()
+          email = parts[1].toLowerCase()
+          result = parts[0].toLowerCase()
         }
       }
       
       if (!email.includes('@')) continue
       pairs.push({ result, email })
     }
+    
+    console.log('downloadCsvPairs: downloaded', { fileId, filter, count: pairs.length, sample: pairs.slice(0, 3) })
     return pairs
   } catch (e) {
     console.error('downloadCsvPairs: exception', { fileId, filter, error: (e as any)?.message || String(e) })
@@ -220,10 +248,15 @@ async function processBatch() {
       // Only ok (not catch_all) -> verified_ok
       // Risky emails (ok_and_catch_all) -> verified_bad (treat as bad)
       const okEmails = Array.from(new Set(okPairs.map(p => p.email)))
+      const okEmailsSet = new Set(okEmails) // For fast lookup
+      
       // invalid and risky (catch_all) -> verified_bad
+      // Exclude emails that are in okEmails (some emails appear in both ok and ok_and_catch_all)
       const badEmails = Array.from(new Set([
         ...invalidPairs.map(p => p.email),
-        ...okAndCatchAllPairs.map(p => p.email) // Risky emails count as bad
+        ...okAndCatchAllPairs
+          .map(p => p.email)
+          .filter(email => !okEmailsSet.has(email)) // Exclude emails already marked as ok
       ]))
       // unknown -> verified_unknown
       const unknownEmails = Array.from(new Set(unknownPairs.map(p => p.email)))
