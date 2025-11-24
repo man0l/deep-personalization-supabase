@@ -58,15 +58,14 @@ async function fetchFileInfo(apiKey: string, fileId: string): Promise<FileInfo |
   }
 }
 
-async function downloadCsvPairs(apiKey: string, fileId: string, filter: string): Promise<{ result: string; email: string }[]> {
-  const url = `https://bulkapi.millionverifier.com/bulkapi/v2/download?key=${encodeURIComponent(apiKey)}&file_id=${encodeURIComponent(fileId)}&filter=${encodeURIComponent(filter)}`
+async function downloadAllResults(apiKey: string, fileId: string): Promise<{ email: string; quality: string; result: string }[]> {
+  const url = `https://bulkapi.millionverifier.com/bulkapi/v2/download?key=${encodeURIComponent(apiKey)}&file_id=${encodeURIComponent(fileId)}&filter=all`
   try {
     const res = await fetch(url)
     if (!res.ok) {
       const errorText = await res.text().catch(() => '')
-      console.error('downloadCsvPairs: HTTP error', { 
+      console.error('downloadAllResults: HTTP error', { 
         fileId, 
-        filter, 
         status: res.status, 
         statusText: res.statusText,
         response: errorText.substring(0, 200)
@@ -75,53 +74,48 @@ async function downloadCsvPairs(apiKey: string, fileId: string, filter: string):
     }
     const text = (await res.text()) || ''
     if (!text.trim()) {
-      console.log('downloadCsvPairs: empty response', { fileId, filter })
+      console.log('downloadAllResults: empty response', { fileId })
       return []
     }
     
     const lines = text.split(/\r?\n/)
-    const pairs: { result: string; email: string }[] = []
+    const results: { email: string; quality: string; result: string }[] = []
     let headerSkipped = false
+    let emailIdx = -1
+    let qualityIdx = -1
+    let resultIdx = -1
     
     for (const line of lines) {
       const l = line.trim()
       if (!l) continue
       
-      // Skip header row if present
-      if (!headerSkipped && (l.toLowerCase().includes('email') || l.toLowerCase().includes('result'))) {
+      // Parse header row
+      if (!headerSkipped) {
+        const headers = l.split(',').map(h => h.trim().toLowerCase().replace(/"/g, ''))
+        emailIdx = headers.indexOf('email')
+        qualityIdx = headers.indexOf('quality')
+        resultIdx = headers.indexOf('result')
         headerSkipped = true
         continue
       }
-      headerSkipped = true
       
-      // MillionVerifier CSV format: typically just email per line when using filters
-      // But could also be email,result or result,email
-      const parts = l.split(',').map(p => p.trim())
-      let email = ''
-      let result = filter // Default result is the filter name
-      
-      if (parts.length === 1) {
-        // Just email, no result column
-        email = parts[0].toLowerCase()
-      } else if (parts.length >= 2) {
-        // Try both orders: email,result and result,email
-        email = parts[0].toLowerCase()
-        result = parts[1].toLowerCase()
-        // If first part doesn't look like an email, try reverse
-        if (!email.includes('@')) {
-          email = parts[1].toLowerCase()
-          result = parts[0].toLowerCase()
+      // Parse data rows
+      const parts = l.split(',').map(p => p.trim().replace(/"/g, ''))
+      if (emailIdx >= 0 && emailIdx < parts.length) {
+        const email = parts[emailIdx].toLowerCase()
+        const quality = qualityIdx >= 0 && qualityIdx < parts.length ? parts[qualityIdx].toLowerCase() : ''
+        const result = resultIdx >= 0 && resultIdx < parts.length ? parts[resultIdx].toLowerCase() : ''
+        
+        if (email.includes('@')) {
+          results.push({ email, quality, result })
         }
       }
-      
-      if (!email.includes('@')) continue
-      pairs.push({ result, email })
     }
     
-    console.log('downloadCsvPairs: downloaded', { fileId, filter, count: pairs.length, sample: pairs.slice(0, 3) })
-    return pairs
+    console.log('downloadAllResults: downloaded', { fileId, count: results.length, sample: results.slice(0, 3) })
+    return results
   } catch (e) {
-    console.error('downloadCsvPairs: exception', { fileId, filter, error: (e as any)?.message || String(e) })
+    console.error('downloadAllResults: exception', { fileId, error: (e as any)?.message || String(e) })
     return []
   }
 }
@@ -275,20 +269,12 @@ async function processBatch() {
       
       console.log('verification-worker: mapped emails', {
         fileId: f.file_id,
-        okCount: okEmails.length,
-        badCount: badEmails.length,
-        unknownCount: unknownEmails.length,
-        okEmailsSample: Array.from(okEmails).slice(0, 5),
-        badEmailsSample: Array.from(badEmails).slice(0, 5),
-        okAndCatchAllCount: okAndCatchAllPairs.length,
-        okAndCatchAllAfterFilter: okAndCatchAllPairs.filter(p => !okEmailsSet.has(p.email)).length,
-        fileEmailsCount: fileEmailsForComparison.length,
-        okInFile: okInFile.length,
-        badInFile: badInFile.length,
-        okNotInFile: okNotInFile.length,
-        badNotInFile: badNotInFile.length,
-        okNotInFileSample: okNotInFile.slice(0, 3),
-        badNotInFileSample: badNotInFile.slice(0, 3),
+        okCount: okEmailsSet.size,
+        badCount: badEmailsSet.size,
+        unknownCount: unknownEmailsSet.size,
+        okEmailsSample: Array.from(okEmailsSet).slice(0, 5),
+        badEmailsSample: Array.from(badEmailsSet).slice(0, 5),
+        unknownEmailsSample: Array.from(unknownEmailsSet).slice(0, 5),
       })
 
       console.log('verification-worker:complete', {
@@ -296,9 +282,9 @@ async function processBatch() {
         status: info.status,
         linesProcessed: info.lines_processed,
         linesTotal: info.lines,
-        ok: okEmails.length,
-        bad: badEmails.length,
-        unknown: unknownEmails.length,
+        ok: okEmailsSet.size,
+        bad: badEmailsSet.size,
+        unknown: unknownEmailsSet.size,
       })
 
       // Fetch ALL campaign leads for case-insensitive email matching
@@ -466,31 +452,33 @@ async function processBatch() {
 
       console.log('verification-worker: updating leads', {
         fileId: f.file_id,
-        okCount: okEmails.length,
-        badCount: badEmails.length,
-        unknownCount: unknownEmails.length,
+        okCount: okEmailsSet.size,
+        badCount: badEmailsSet.size,
+        unknownCount: unknownEmailsSet.size,
       })
       
-      await updateLeadsByEmail(okEmails, 'verified_ok')
-      await updateLeadsByEmail(badEmails, 'verified_bad')
-      await updateLeadsByEmail(unknownEmails, 'verified_unknown')
+      await updateLeadsByEmail(Array.from(okEmailsSet), 'verified_ok')
+      await updateLeadsByEmail(Array.from(badEmailsSet), 'verified_bad')
+      await updateLeadsByEmail(Array.from(unknownEmailsSet), 'verified_unknown')
       
       console.log('verification-worker: leads updated', {
         fileId: f.file_id,
-        okUpdated: okEmails.length,
-        badUpdated: badEmails.length,
-        unknownUpdated: unknownEmails.length,
+        okUpdated: okEmailsSet.size,
+        badUpdated: badEmailsSet.size,
+        unknownUpdated: unknownEmailsSet.size,
       })
 
-      // Any remaining emails from the upload that are not in ok/bad -> mark as verified_unknown
+      // Any remaining emails from the upload that are not in any result -> mark as verified_unknown
       try {
-        const uploaded: string[] = Array.isArray((f as any).emails) ? ((f as any).emails as any[]).map((e:any)=> String(e).toLowerCase()) : []
+        const uploaded: string[] = Array.isArray((f as any).emails) ? ((f as any).emails as any[]).map((e:any)=> String(e).toLowerCase().trim()) : []
         if (uploaded.length) {
-          // Consider already known unknowns too
-          const known = new Set<string>([...okEmails, ...badEmails, ...unknownEmails].map((e)=> e.toLowerCase()))
+          // Consider all known results
+          const known = new Set<string>([...okEmailsSet, ...badEmailsSet, ...unknownEmailsSet])
           const remainingUnknownEmails = uploaded.filter((e)=> !known.has(e))
-          await updateLeadsByEmail(remainingUnknownEmails, 'verified_unknown')
-          console.log('verification-worker:unknown_rest', { fileId: f.file_id, unknown: remainingUnknownEmails.length })
+          if (remainingUnknownEmails.length > 0) {
+            await updateLeadsByEmail(remainingUnknownEmails, 'verified_unknown')
+            console.log('verification-worker:unknown_rest', { fileId: f.file_id, unknown: remainingUnknownEmails.length, sample: remainingUnknownEmails.slice(0, 3) })
+          }
         }
       } catch (e) {
         console.error('verification-worker:unknown error', (e as any)?.message || String(e))
