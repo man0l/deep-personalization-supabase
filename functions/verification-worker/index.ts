@@ -266,7 +266,10 @@ async function processBatch() {
         okCount: okEmails.length,
         badCount: badEmails.length,
         unknownCount: unknownEmails.length,
-        badEmailsSample: Array.from(badEmails).slice(0, 3),
+        okEmailsSample: Array.from(okEmails).slice(0, 5),
+        badEmailsSample: Array.from(badEmails).slice(0, 5),
+        okAndCatchAllCount: okAndCatchAllPairs.length,
+        okAndCatchAllAfterFilter: okAndCatchAllPairs.filter(p => !okEmailsSet.has(p.email)).length,
       })
 
       console.log('verification-worker:complete', {
