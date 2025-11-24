@@ -32,17 +32,14 @@ async function fetchFileInfo(apiKey: string, fileId: string): Promise<FileInfo |
       const errorText = await res.text().catch(() => '')
       console.error('fetchFileInfo: HTTP error', { 
         fileId: cleanFileId,
-        fileIdType: typeof cleanFileId,
         status: res.status, 
         statusText: res.statusText,
-        url: url.replace(apiKey, '***'), // Log URL without exposing full key
-        response: errorText.substring(0, 200)
       })
       return null
     }
     const json = await res.json().catch(() => null)
     if (!json || typeof json !== 'object') {
-      console.error('fetchFileInfo: invalid JSON', { fileId, preview: (await res.text().catch(() => '')).substring(0, 200) })
+      console.error('fetchFileInfo: invalid JSON', { fileId })
       return null
     }
     // MillionVerifier returns JSON with status field: in_progress, finished, canceled
@@ -68,7 +65,6 @@ async function downloadAllResults(apiKey: string, fileId: string): Promise<{ ema
         fileId, 
         status: res.status, 
         statusText: res.statusText,
-        response: errorText.substring(0, 200)
       })
       return []
     }
@@ -85,13 +81,46 @@ async function downloadAllResults(apiKey: string, fileId: string): Promise<{ ema
     let qualityIdx = -1
     let resultIdx = -1
     
+    // Helper function to parse CSV line with quoted fields
+    function parseCSVLine(line: string): string[] {
+      const fields: string[] = []
+      let current = ''
+      let inQuotes = false
+      
+      for (let i = 0; i < line.length; i++) {
+        const char = line[i]
+        
+        if (char === '"') {
+          if (inQuotes && line[i + 1] === '"') {
+            // Escaped quote
+            current += '"'
+            i++ // Skip next quote
+          } else {
+            // Toggle quote state
+            inQuotes = !inQuotes
+          }
+        } else if (char === ',' && !inQuotes) {
+          // Field separator
+          fields.push(current.trim())
+          current = ''
+        } else {
+          current += char
+        }
+      }
+      // Add last field
+      fields.push(current.trim())
+      
+      // Remove quotes from fields
+      return fields.map(f => f.replace(/^"|"$/g, ''))
+    }
+    
     for (const line of lines) {
       const l = line.trim()
       if (!l) continue
       
       // Parse header row
       if (!headerSkipped) {
-        const headers = l.split(',').map(h => h.trim().toLowerCase().replace(/"/g, ''))
+        const headers = parseCSVLine(l).map(h => h.toLowerCase())
         emailIdx = headers.indexOf('email')
         qualityIdx = headers.indexOf('quality')
         resultIdx = headers.indexOf('result')
@@ -100,11 +129,11 @@ async function downloadAllResults(apiKey: string, fileId: string): Promise<{ ema
       }
       
       // Parse data rows
-      const parts = l.split(',').map(p => p.trim().replace(/"/g, ''))
+      const parts = parseCSVLine(l)
       if (emailIdx >= 0 && emailIdx < parts.length) {
-        const email = parts[emailIdx].toLowerCase()
-        const quality = qualityIdx >= 0 && qualityIdx < parts.length ? parts[qualityIdx].toLowerCase() : ''
-        const result = resultIdx >= 0 && resultIdx < parts.length ? parts[resultIdx].toLowerCase() : ''
+        const email = parts[emailIdx].toLowerCase().trim()
+        const quality = qualityIdx >= 0 && qualityIdx < parts.length ? parts[qualityIdx].toLowerCase().trim() : ''
+        const result = resultIdx >= 0 && resultIdx < parts.length ? parts[resultIdx].toLowerCase().trim() : ''
         
         if (email.includes('@')) {
           results.push({ email, quality, result })
@@ -112,7 +141,7 @@ async function downloadAllResults(apiKey: string, fileId: string): Promise<{ ema
       }
     }
     
-    console.log('downloadAllResults: downloaded', { fileId, count: results.length, sample: results.slice(0, 3) })
+    console.log('downloadAllResults: downloaded', { fileId, count: results.length })
     return results
   } catch (e) {
     console.error('downloadAllResults: exception', { fileId, error: (e as any)?.message || String(e) })
@@ -148,19 +177,15 @@ async function processBatch() {
     return new Response('no files')
   }
 
-  console.log('verification-worker: processing', { fileCount: files.length, fileIds: files.map((f: any) => f.file_id) })
+  console.log('verification-worker: processing', { fileCount: files.length })
 
   for (const f of files) {
     try {
-      console.log('verification-worker: checking file', { fileId: f.file_id, id: f.id, filename: (f as any).filename })
+      console.log('verification-worker: checking file', { fileId: f.file_id })
       const info = await fetchFileInfo(apiKey, f.file_id)
       const nowIso = new Date().toISOString()
       if (!info) {
-        console.log('verification-worker: file info null (likely 404 or error)', { 
-          fileId: f.file_id,
-          fileIdType: typeof f.file_id,
-          fileIdLength: String(f.file_id).length
-        })
+        console.log('verification-worker: file info null', { fileId: f.file_id })
         // Don't mark as checked if it's a 404 - might be a temporary issue or wrong file_id format
         // Only update checked_at if we've tried multiple times
         await supabase
@@ -169,7 +194,7 @@ async function processBatch() {
           .eq('id', f.id)
         continue
       }
-      console.log('verification-worker: file info retrieved', { fileId: f.file_id, status: info.status, linesProcessed: info.lines_processed })
+      console.log('verification-worker: file info', { fileId: f.file_id, status: info.status, linesProcessed: info.lines_processed })
       // Update file record with latest info
       await supabase
         .from('email_verification_files')
@@ -199,33 +224,21 @@ async function processBatch() {
         console.log('verification-worker:progress', {
           fileId: f.file_id,
           status: info.status,
-          statusLower,
           linesProcessed: info.lines_processed,
           linesTotal: info.lines,
-          complete,
-          allProcessed,
         })
         continue
       }
       
-      console.log('verification-worker: file complete, processing results', {
+      console.log('verification-worker: file complete', {
         fileId: f.file_id,
         status: info.status,
         linesProcessed: info.lines_processed,
         linesTotal: info.lines,
-        complete,
-        allProcessed,
       })
 
       // Download all results from MillionVerifier (using filter=all to get complete CSV with quality/result columns)
-      console.log('verification-worker: downloading all results', { fileId: f.file_id })
       const allResults = await downloadAllResults(apiKey, f.file_id)
-      
-      console.log('verification-worker: downloaded counts', {
-        fileId: f.file_id,
-        total: allResults.length,
-        sample: allResults.slice(0, 3),
-      })
       
       // Map MillionVerifier results to our statuses based on quality and result columns
       // quality: "good", "risky", "bad"
@@ -262,16 +275,10 @@ async function processBatch() {
         okCount: okEmailsSet.size,
         badCount: badEmailsSet.size,
         unknownCount: unknownEmailsSet.size,
-        okEmailsSample: Array.from(okEmailsSet).slice(0, 5),
-        badEmailsSample: Array.from(badEmailsSet).slice(0, 5),
-        unknownEmailsSample: Array.from(unknownEmailsSet).slice(0, 5),
       })
 
-      console.log('verification-worker:complete', {
+      console.log('verification-worker: complete', {
         fileId: f.file_id,
-        status: info.status,
-        linesProcessed: info.lines_processed,
-        linesTotal: info.lines,
         ok: okEmailsSet.size,
         bad: badEmailsSet.size,
         unknown: unknownEmailsSet.size,
@@ -305,7 +312,6 @@ async function processBatch() {
       console.log('verification-worker: emailToIds map built', {
         fileId: f.file_id,
         mapSize: emailToIds.size,
-        sampleKeys: Array.from(emailToIds.keys()).slice(0, 5),
       })
       
       // Helper function to update leads by email (case-insensitive)
@@ -327,7 +333,6 @@ async function processBatch() {
             fileId: f.file_id,
             status,
             notFoundCount: notFound.length,
-            notFoundSample: notFound.slice(0, 5),
             totalEmails: emails.length,
             foundIds: allIds.length,
           })
@@ -401,7 +406,7 @@ async function processBatch() {
           const remainingUnknownEmails = uploaded.filter((e)=> !known.has(e))
           if (remainingUnknownEmails.length > 0) {
             await updateLeadsByEmail(remainingUnknownEmails, 'verified_unknown')
-            console.log('verification-worker:unknown_rest', { fileId: f.file_id, unknown: remainingUnknownEmails.length, sample: remainingUnknownEmails.slice(0, 3) })
+            console.log('verification-worker:unknown_rest', { fileId: f.file_id, unknown: remainingUnknownEmails.length })
           }
         }
       } catch (e) {
