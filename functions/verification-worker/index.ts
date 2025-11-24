@@ -217,55 +217,45 @@ async function processBatch() {
         allProcessed,
       })
 
-      // Download results using MillionVerifier filter parameters
-      // filter options: ok, ok_and_catch_all, unknown, invalid, all
-      console.log('verification-worker: downloading results', { fileId: f.file_id })
-      const okPairs = await downloadCsvPairs(apiKey, f.file_id, 'ok')
-      const okAndCatchAllPairs = await downloadCsvPairs(apiKey, f.file_id, 'ok_and_catch_all')
-      const invalidPairs = await downloadCsvPairs(apiKey, f.file_id, 'invalid')
-      const unknownPairs = await downloadCsvPairs(apiKey, f.file_id, 'unknown')
+      // Download all results from MillionVerifier (using filter=all to get complete CSV with quality/result columns)
+      console.log('verification-worker: downloading all results', { fileId: f.file_id })
+      const allResults = await downloadAllResults(apiKey, f.file_id)
       
       console.log('verification-worker: downloaded counts', {
         fileId: f.file_id,
-        ok: okPairs.length,
-        okAndCatchAll: okAndCatchAllPairs.length,
-        invalid: invalidPairs.length,
-        unknown: unknownPairs.length,
-        okSample: okPairs.slice(0, 2),
-        catchAllSample: okAndCatchAllPairs.slice(0, 2),
+        total: allResults.length,
+        sample: allResults.slice(0, 3),
       })
       
-      // Combine all results
-      const allPairs = [...okPairs, ...okAndCatchAllPairs, ...invalidPairs, ...unknownPairs]
+      // Map MillionVerifier results to our statuses based on quality and result columns
+      // quality: "good", "risky", "bad"
+      // result: "ok", "catch_all", "invalid", "unknown"
+      // Only "good" + "ok" -> verified_ok
+      // "risky" + "catch_all" or "bad" + "invalid" -> verified_bad
+      // Everything else (including "unknown" result) -> verified_unknown
+      const okEmails: string[] = []
+      const badEmails: string[] = []
+      const unknownEmails: string[] = []
       
-      // Map MillionVerifier results to our statuses
-      // Only ok (not catch_all) -> verified_ok
-      // Risky emails (ok_and_catch_all) -> verified_bad (treat as bad)
-      const okEmails = Array.from(new Set(okPairs.map(p => p.email)))
-      const okEmailsSet = new Set(okEmails) // For fast lookup
+      for (const r of allResults) {
+        const email = r.email.toLowerCase().trim()
+        const quality = r.quality.toLowerCase()
+        const result = r.result.toLowerCase()
+        
+        if (quality === 'good' && result === 'ok') {
+          okEmails.push(email)
+        } else if ((quality === 'risky' && result === 'catch_all') || (quality === 'bad' && result === 'invalid')) {
+          badEmails.push(email)
+        } else {
+          // Everything else (unknown result, or any other combination)
+          unknownEmails.push(email)
+        }
+      }
       
-      // invalid and risky (catch_all) -> verified_bad
-      // Exclude emails that are in okEmails (some emails appear in both ok and ok_and_catch_all)
-      const badEmails = Array.from(new Set([
-        ...invalidPairs.map(p => p.email),
-        ...okAndCatchAllPairs
-          .map(p => p.email)
-          .filter(email => !okEmailsSet.has(email)) // Exclude emails already marked as ok
-      ]))
-      // unknown -> verified_unknown
-      const unknownEmails = Array.from(new Set(unknownPairs.map(p => p.email)))
-      
-      // Get file emails for comparison
-      const fileEmailsForComparison: string[] = Array.isArray((f as any).emails) 
-        ? ((f as any).emails as any[]).map((e:any)=> String(e).toLowerCase().trim())
-        : []
-      const fileEmailsSetForComparison = new Set(fileEmailsForComparison)
-      
-      // Check which downloaded emails are in the file
-      const okInFile = okEmails.filter(e => fileEmailsSetForComparison.has(e.toLowerCase().trim()))
-      const badInFile = badEmails.filter(e => fileEmailsSetForComparison.has(e.toLowerCase().trim()))
-      const okNotInFile = okEmails.filter(e => !fileEmailsSetForComparison.has(e.toLowerCase().trim()))
-      const badNotInFile = badEmails.filter(e => !fileEmailsSetForComparison.has(e.toLowerCase().trim()))
+      // Remove duplicates
+      const okEmailsSet = new Set(okEmails)
+      const badEmailsSet = new Set(badEmails)
+      const unknownEmailsSet = new Set(unknownEmails)
       
       console.log('verification-worker: mapped emails', {
         fileId: f.file_id,
