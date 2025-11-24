@@ -160,23 +160,58 @@ async function processBatch() {
 
       const statusLower = (info.status || '').toLowerCase()
       // MillionVerifier status: in_progress, finished, canceled
-      const complete = statusLower === 'finished'
-      if (!complete) {
+      // Also check if all lines are processed (sometimes status might be different)
+      const complete = statusLower === 'finished' || 
+                      statusLower === 'completed' || 
+                      statusLower === 'done' ||
+                      statusLower === 'complete'
+      
+      // If status doesn't indicate finished, but we have processed all lines, consider it finished
+      const allProcessed = info.lines && info.lines_processed && 
+                          info.lines > 0 && 
+                          info.lines_processed >= info.lines
+      
+      const isComplete = complete || allProcessed
+      
+      if (!isComplete) {
         console.log('verification-worker:progress', {
           fileId: f.file_id,
           status: info.status,
+          statusLower,
           linesProcessed: info.lines_processed,
           linesTotal: info.lines,
+          complete,
+          allProcessed,
         })
         continue
       }
+      
+      console.log('verification-worker: file complete, processing results', {
+        fileId: f.file_id,
+        status: info.status,
+        linesProcessed: info.lines_processed,
+        linesTotal: info.lines,
+        complete,
+        allProcessed,
+      })
 
       // Download results using MillionVerifier filter parameters
       // filter options: ok, ok_and_catch_all, unknown, invalid, all
+      console.log('verification-worker: downloading results', { fileId: f.file_id })
       const okPairs = await downloadCsvPairs(apiKey, f.file_id, 'ok')
       const okAndCatchAllPairs = await downloadCsvPairs(apiKey, f.file_id, 'ok_and_catch_all')
       const invalidPairs = await downloadCsvPairs(apiKey, f.file_id, 'invalid')
       const unknownPairs = await downloadCsvPairs(apiKey, f.file_id, 'unknown')
+      
+      console.log('verification-worker: downloaded counts', {
+        fileId: f.file_id,
+        ok: okPairs.length,
+        okAndCatchAll: okAndCatchAllPairs.length,
+        invalid: invalidPairs.length,
+        unknown: unknownPairs.length,
+        okSample: okPairs.slice(0, 2),
+        catchAllSample: okAndCatchAllPairs.slice(0, 2),
+      })
       
       // Combine all results
       const allPairs = [...okPairs, ...okAndCatchAllPairs, ...invalidPairs, ...unknownPairs]
@@ -192,6 +227,14 @@ async function processBatch() {
       ]))
       // unknown -> verified_unknown
       const unknownEmails = Array.from(new Set(unknownPairs.map(p => p.email)))
+      
+      console.log('verification-worker: mapped emails', {
+        fileId: f.file_id,
+        okCount: okEmails.length,
+        badCount: badEmails.length,
+        unknownCount: unknownEmails.length,
+        badEmailsSample: Array.from(badEmails).slice(0, 3),
+      })
 
       console.log('verification-worker:complete', {
         fileId: f.file_id,
@@ -249,9 +292,23 @@ async function processBatch() {
         }
       }
 
+      console.log('verification-worker: updating leads', {
+        fileId: f.file_id,
+        okCount: okEmails.length,
+        badCount: badEmails.length,
+        unknownCount: unknownEmails.length,
+      })
+      
       await updateLeadsByEmail(okEmails, 'verified_ok')
       await updateLeadsByEmail(badEmails, 'verified_bad')
       await updateLeadsByEmail(unknownEmails, 'verified_unknown')
+      
+      console.log('verification-worker: leads updated', {
+        fileId: f.file_id,
+        okUpdated: okEmails.length,
+        badUpdated: badEmails.length,
+        unknownUpdated: unknownEmails.length,
+      })
 
       // Any remaining emails from the upload that are not in ok/bad -> mark as verified_unknown
       try {
